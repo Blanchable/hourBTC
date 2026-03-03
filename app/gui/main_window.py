@@ -1,4 +1,5 @@
 import logging
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QThread
@@ -142,7 +143,7 @@ class MainWindow(QMainWindow):
         self.s_stop_loss = QLineEdit(); self.s_take_profit = QLineEdit(); self.s_max_pos_contracts = QLineEdit()
         self.s_max_pos_notional = QLineEdit(); self.s_max_total_notional = QLineEdit(); self.s_max_trades = QLineEdit()
         self.s_max_losses = QLineEdit(); self.s_entry_timeout = QLineEdit(); self.s_cooldown = QLineEdit()
-        self.s_market_refresh = QLineEdit(); self.s_backoff = QLineEdit(); self.s_quote_stale = QLineEdit()
+        self.s_market_refresh = QLineEdit(); self.s_backoff = QLineEdit(); self.s_fallback_window = QLineEdit(); self.s_quote_stale = QLineEdit()
         self.s_max_api_errors = QLineEdit(); self.s_max_order_rejections = QLineEdit()
         self.s_dry_run = QCheckBox("Dry Run Mode")
         self.s_entry_post_only = QCheckBox("Entry Post-Only")
@@ -154,7 +155,7 @@ class MainWindow(QMainWindow):
             ("Max Total Open Notional ($)", self.s_max_total_notional), ("Max Trades Per Session", self.s_max_trades),
             ("Max Consecutive Losses", self.s_max_losses), ("Entry Timeout (seconds)", self.s_entry_timeout),
             ("Cooldown After Loss (seconds)", self.s_cooldown), ("Market List Refresh (seconds)", self.s_market_refresh),
-            ("Rate Limit Backoff (seconds)", self.s_backoff), ("Quote Stale Stop (seconds)", self.s_quote_stale),
+            ("Rate Limit Backoff (seconds)", self.s_backoff), ("Fallback Window (hours)", self.s_fallback_window), ("Quote Stale Stop (seconds)", self.s_quote_stale),
             ("Max API Errors Per Session", self.s_max_api_errors), ("Max Order Rejections Per Session", self.s_max_order_rejections),
         ]
         for i, (lbl, w) in enumerate(rows):
@@ -206,6 +207,7 @@ class MainWindow(QMainWindow):
         self.s_cooldown.setText(str(rs.cooldown_after_loss_seconds))
         self.s_market_refresh.setText(str(rs.market_list_refresh_seconds))
         self.s_backoff.setText(str(rs.rate_limit_backoff_seconds))
+        self.s_fallback_window.setText(str(rs.fallback_window_hours))
         self.s_quote_stale.setText(str(rs.quote_stale_stop_seconds))
         self.s_max_api_errors.setText(str(rs.max_api_errors_per_session))
         self.s_max_order_rejections.setText(str(rs.max_order_rejections_per_session))
@@ -228,6 +230,7 @@ class MainWindow(QMainWindow):
                 market_list_refresh_seconds=int(self.s_market_refresh.text()),
                 rate_limit_backoff_seconds=int(self.s_backoff.text()),
                 rate_limit_backoff_max_seconds=max(int(self.s_backoff.text()) * 3, int(self.s_backoff.text())),
+                fallback_window_hours=int(self.s_fallback_window.text()),
                 dry_run_mode=self.s_dry_run.isChecked(),
                 entry_post_only=self.s_entry_post_only.isChecked(),
                 disable_new_entries_after_stop_hit=self.s_disable_after_stop.isChecked(),
@@ -244,6 +247,7 @@ class MainWindow(QMainWindow):
         if rs.entry_order_timeout_seconds < 1: errs.append("Entry Timeout must be >= 1")
         if rs.market_list_refresh_seconds < 5: errs.append("Market List Refresh must be >= 5")
         if rs.rate_limit_backoff_seconds < 1: errs.append("Rate limit backoff must be >= 1")
+        if rs.fallback_window_hours < 1: errs.append("Fallback window must be >= 1")
         if rs.max_total_open_notional_cents < rs.max_position_notional_cents: errs.append("Max total notional must be >= max position notional")
         if rs.session_stop_loss_cents < 0 or rs.session_take_profit_cents < 0: errs.append("Dollar values must be non-negative")
         if errs:
@@ -372,7 +376,7 @@ class MainWindow(QMainWindow):
         env,a,k=v; c=KalshiClient(env,a,k)
         try:
             self.append_log(f"Trade series: {settings.global_settings.btc_hourly_trade_series_ticker}")
-            spot=SpotClient().fetch_btc_spot(); t=c.resolve_btc_hourly_trade_target_market(spot_price=spot, markets=c.get_open_hourly_trade_markets_live(force_refresh=True))
+            spot=SpotClient().fetch_btc_spot(); t=c.resolve_btc_hourly_trade_target_market(spot_price=spot, markets=c.get_live_candidate_trade_markets(force_refresh=True, fallback_window_hours=self.runtime_settings.fallback_window_hours, cache_ttl_seconds=self.runtime_settings.market_list_refresh_seconds))
             if not t: self.append_log("No threshold target found"); return
             self.append_log(f"Selected threshold target: {t['ticker']}"); self.append_log(f"Target title: {t.get('title')}")
             rows=c.get_hourly_series_quote_rows([t]); r=rows[0]
@@ -391,7 +395,7 @@ class MainWindow(QMainWindow):
         if not v: return
         env,a,k=v; c=KalshiClient(env,a,k)
         try:
-            spot=SpotClient().fetch_btc_spot(); t=c.resolve_btc_hourly_trade_target_market(spot_price=spot, markets=c.get_open_hourly_trade_markets_live(force_refresh=True))
+            spot=SpotClient().fetch_btc_spot(); t=c.resolve_btc_hourly_trade_target_market(spot_price=spot, markets=c.get_live_candidate_trade_markets(force_refresh=True, fallback_window_hours=self.runtime_settings.fallback_window_hours, cache_ttl_seconds=self.runtime_settings.market_list_refresh_seconds))
             if not t: self.append_error("No threshold target found for smoke test"); return
             r=c.get_hourly_series_quote_rows([t])[0]; yes_bid=int(r.get("yes_bid") or 20); safe=max(1, yes_bid-20)
             self.append_log(f"Selected threshold target: {t['ticker']}")

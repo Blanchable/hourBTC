@@ -157,12 +157,22 @@ class KalshiClient:
     def get_orderbook_snapshot(self, ticker: str) -> dict:
         return self._request("GET", f"/trade-api/v2/markets/{ticker}/orderbook")
 
-    def _get_all_markets_for_series(self, series_ticker: str, status: str | None = None) -> list[dict]:
+    def _get_all_markets_for_series(
+        self,
+        series_ticker: str,
+        status: str | None = None,
+        close_time_start_ts: int | None = None,
+        close_time_end_ts: int | None = None,
+    ) -> list[dict]:
         cursor, rows = None, []
         while True:
             q = {"series_ticker": series_ticker, "limit": 100}
             if status:
                 q["status"] = status
+            if close_time_start_ts is not None:
+                q["close_time_start_ts"] = int(close_time_start_ts)
+            if close_time_end_ts is not None:
+                q["close_time_end_ts"] = int(close_time_end_ts)
             if cursor:
                 q["cursor"] = cursor
             payload = self._request("GET", f"/trade-api/v2/markets?{urlencode(q)}")
@@ -172,53 +182,127 @@ class KalshiClient:
                 break
         return rows
 
-    def _is_tradable(self, market: dict) -> bool:
-        status = str(market.get("status", "")).lower()
-        if status and status not in {"open", "active", "initialized", "paused"}:
+    def _is_tradable(self, row: dict, now: datetime | None = None) -> bool:
+        now = now or datetime.now(timezone.utc)
+        status = str(row.get("status", "")).lower()
+        if status in {"closed", "settled", "determined", "finalized", "expired"}:
             return False
-        close = market.get("close_time")
-        if close:
-            try:
-                if datetime.fromisoformat(close.replace("Z", "+00:00")) <= datetime.now(timezone.utc):
-                    return False
-            except Exception:
-                pass
-        return True
+        close = row.get("close_time")
+        if not close:
+            return False
+        try:
+            close_dt = datetime.fromisoformat(close.replace("Z", "+00:00"))
+        except Exception:
+            return False
+        return close_dt > now - timedelta(minutes=2)
 
     def is_threshold_hourly_btc_market(self, row: dict) -> bool:
-        title = str(row.get("title", "")).lower()
-        return "bitcoin price today at" in title and "range" not in title
+        t = str(row.get("title", "")).lower()
+        return "bitcoin price today at" in t and "range" not in t
 
     def is_range_hourly_btc_market(self, row: dict) -> bool:
         return "bitcoin price range" in str(row.get("title", "")).lower()
 
-    def get_open_hourly_trade_markets_live(self, force_refresh: bool = False) -> list[dict]:
-        ttl = settings.global_settings.market_list_refresh_seconds
+    def is_live_trade_candidate(self, row: dict, now: datetime | None = None) -> bool:
+        now = now or datetime.now(timezone.utc)
+        series = str(row.get("series_ticker", settings.global_settings.btc_hourly_trade_series_ticker))
+        if series != settings.global_settings.btc_hourly_trade_series_ticker:
+            return False
+        if not self.is_threshold_hourly_btc_market(row):
+            return False
+        if self.is_range_hourly_btc_market(row):
+            return False
+        if not self._is_tradable(row, now=now):
+            return False
+        status = str(row.get("status", "")).lower()
+        return status in {"", "open", "active", "initialized", "paused", "inactive"}
+
+    def filter_live_trade_candidates(self, rows: list[dict], now: datetime | None = None) -> list[dict]:
+        now = now or datetime.now(timezone.utc)
+        out = [r for r in rows if self.is_live_trade_candidate(r, now=now)]
+        return sorted(out, key=lambda m: (m.get("close_time", ""), m.get("ticker", "")))
+
+    def _get_windowed_trade_markets(self, now: datetime | None = None, fallback_window_hours: int | None = None) -> list[dict]:
+        now = now or datetime.now(timezone.utc)
+        fallback_window_hours = fallback_window_hours or settings.global_settings.fallback_window_hours
+        window_start = now - timedelta(hours=1)
+        window_end = now + timedelta(hours=fallback_window_hours)
+        rows = self._get_all_markets_for_series(
+            settings.global_settings.btc_hourly_trade_series_ticker,
+            status=None,
+            close_time_start_ts=int(window_start.timestamp()),
+            close_time_end_ts=int(window_end.timestamp()),
+        )
+        bounded = []
+        for row in rows:
+            try:
+                close_dt = datetime.fromisoformat(str(row.get("close_time", "")).replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if window_start <= close_dt <= window_end:
+                bounded.append(row)
+        return bounded
+
+    def get_open_hourly_trade_markets_live(self, force_refresh: bool = False, cache_ttl_seconds: int | None = None) -> list[dict]:
         now = time.time()
+        ttl = cache_ttl_seconds or settings.global_settings.market_list_refresh_seconds
         if not force_refresh and self._market_cache_rows and (now - self._market_cache_ts) < ttl:
             return self._market_cache_rows
-        series = settings.global_settings.btc_hourly_trade_series_ticker
-        open_rows = self._get_all_markets_for_series(series, status="open")
-        rows = [r for r in open_rows if self.is_threshold_hourly_btc_market(r) and self._is_tradable(r)]
-        self._market_cache_rows = sorted(rows, key=lambda m: (m.get("close_time", ""), m.get("ticker", "")))
+        open_rows = self._get_all_markets_for_series(settings.global_settings.btc_hourly_trade_series_ticker, status="open")
+        filtered = self.filter_live_trade_candidates(open_rows)
+        self._market_cache_rows = filtered
         self._market_cache_ts = now
-        self.last_series_diagnostics = {"series_ticker": series, "open_count": len(open_rows), "fallback_count": 0, "tradable_count": len(rows)}
-        return self._market_cache_rows
+        self.last_series_diagnostics = {
+            "series_ticker": settings.global_settings.btc_hourly_trade_series_ticker,
+            "open_query_count": len(open_rows),
+            "fallback_query_count": 0,
+            "used_fallback": False,
+            "window_start_ts": None,
+            "window_end_ts": None,
+            "candidate_count": len(filtered),
+        }
+        return filtered
+
+    def get_live_candidate_trade_markets(
+        self,
+        now: datetime | None = None,
+        force_refresh: bool = False,
+        fallback_window_hours: int | None = None,
+        cache_ttl_seconds: int | None = None,
+    ) -> list[dict]:
+        now = now or datetime.now(timezone.utc)
+        open_rows = self.get_open_hourly_trade_markets_live(force_refresh=force_refresh, cache_ttl_seconds=cache_ttl_seconds)
+        open_diag = dict(self.last_series_diagnostics or {})
+        if open_rows:
+            return open_rows
+
+        bounded = self._get_windowed_trade_markets(now=now, fallback_window_hours=fallback_window_hours)
+        candidates = self.filter_live_trade_candidates(bounded, now=now)
+        window_start = (now - timedelta(hours=1)).isoformat()
+        window_end = (now + timedelta(hours=(fallback_window_hours or settings.global_settings.fallback_window_hours))).isoformat()
+        self.last_series_diagnostics = {
+            "series_ticker": settings.global_settings.btc_hourly_trade_series_ticker,
+            "open_query_count": open_diag.get("open_query_count", 0),
+            "fallback_query_count": len(bounded),
+            "used_fallback": True,
+            "window_start_ts": window_start,
+            "window_end_ts": window_end,
+            "candidate_count": len(candidates),
+        }
+        self._market_cache_rows = candidates
+        self._market_cache_ts = time.time()
+        return candidates
 
     def get_open_hourly_trade_markets_debug(self) -> list[dict]:
-        series = settings.global_settings.btc_hourly_trade_series_ticker
-        open_rows = self._get_all_markets_for_series(series, status="open")
-        rows = [r for r in open_rows if self.is_threshold_hourly_btc_market(r) and self._is_tradable(r)]
+        open_rows = self._get_all_markets_for_series(settings.global_settings.btc_hourly_trade_series_ticker, status="open")
+        rows = self.filter_live_trade_candidates(open_rows)
         if rows:
-            return sorted(rows, key=lambda m: (m.get("close_time", ""), m.get("ticker", "")))
-        fallback = self._get_all_markets_for_series(series, status=None)
-        filtered = [r for r in fallback if self.is_threshold_hourly_btc_market(r) and self._is_tradable(r)]
-        self.last_series_diagnostics = {"series_ticker": series, "open_count": len(open_rows), "fallback_count": len(fallback), "tradable_count": len(filtered)}
-        return sorted(filtered, key=lambda m: (m.get("close_time", ""), m.get("ticker", "")))
+            return rows
+        fallback = self._get_all_markets_for_series(settings.global_settings.btc_hourly_trade_series_ticker, status=None)
+        return self.filter_live_trade_candidates(fallback)
 
     def get_open_hourly_range_markets(self) -> list[dict]:
-        series = settings.global_settings.btc_hourly_range_series_ticker
-        rows = self._get_all_markets_for_series(series, status="open")
+        rows = self._get_all_markets_for_series(settings.global_settings.btc_hourly_range_series_ticker, status="open")
         return [r for r in rows if self.is_range_hourly_btc_market(r)]
 
     def validate_hourly_series(self) -> dict:
@@ -274,7 +358,7 @@ class KalshiClient:
 
     def resolve_btc_hourly_trade_target_market(self, now: datetime | None = None, spot_price: float | None = None, markets: list[dict] | None = None) -> dict | None:
         now = now or datetime.now(timezone.utc)
-        rows = markets if markets is not None else self.get_open_hourly_trade_markets_live()
+        rows = markets if markets is not None else self.get_live_candidate_trade_markets(now=now)
         if not rows:
             return None
         next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
@@ -292,29 +376,31 @@ class KalshiClient:
         return self.select_best_threshold_contract(grouped[chosen_close], spot_price)
 
     def get_hourly_series_quote_rows(self, markets: list[dict]) -> list[dict]:
-        rows = []
+        out = []
         for m in markets:
-            quotes = {"yes_bid": None, "yes_ask": None, "no_bid": None, "no_ask": None}
+            best = {"yes_bid": None, "yes_ask": None, "no_bid": None, "no_ask": None}
             err = None
             try:
-                quotes = self.extract_best_prices(self.get_orderbook_snapshot(m.get("ticker", "")))
+                best = self.extract_best_prices(self.get_orderbook_snapshot(m.get("ticker", "")))
             except Exception as exc:
                 err = str(exc)
-            rows.append({
-                "ticker": m.get("ticker", ""),
-                "title": m.get("title", ""),
-                "close_time": m.get("close_time", ""),
-                "strike": parse_btc_threshold(m),
-                "status": m.get("status", ""),
-                "event_ticker": m.get("event_ticker", ""),
-                **quotes,
-                "last_update": datetime.now(timezone.utc).isoformat(),
-                "error": err,
-            })
-        return rows
+            out.append(
+                {
+                    "ticker": m.get("ticker", ""),
+                    "title": m.get("title", ""),
+                    "close_time": m.get("close_time", ""),
+                    "strike": parse_btc_threshold(m),
+                    "status": m.get("status", ""),
+                    "event_ticker": m.get("event_ticker", ""),
+                    **best,
+                    "last_update": datetime.now(timezone.utc).isoformat(),
+                    "error": err,
+                }
+            )
+        return out
 
 
 def parse_btc_threshold(market: dict) -> Optional[float]:
     text = " ".join([market.get("title", ""), market.get("subtitle", ""), market.get("ticker", "")])
-    match = re.search(r"(?:above|over|below|under|>=|<=|>|<|at)\s*\$?([0-9]{2,}(?:,[0-9]{3})*(?:\.[0-9]+)?)", text, re.I)
-    return float(match.group(1).replace(",", "")) if match else None
+    m = re.search(r"(?:above|over|below|under|>=|<=|>|<|at)\s*\$?([0-9]{2,}(?:,[0-9]{3})*(?:\.[0-9]+)?)", text, re.I)
+    return float(m.group(1).replace(",", "")) if m else None

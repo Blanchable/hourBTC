@@ -45,6 +45,7 @@ class GlobalSettings:
     market_list_refresh_seconds: int = 45
     rate_limit_backoff_seconds: int = 10
     rate_limit_backoff_max_seconds: int = 30
+    fallback_window_hours: int = 2
     disable_new_entries_after_stop_hit: bool = True
 
     # Operational controls

@@ -19,6 +19,7 @@ class RuntimeSettings:
     market_list_refresh_seconds: int
     rate_limit_backoff_seconds: int
     rate_limit_backoff_max_seconds: int
+    fallback_window_hours: int
     dry_run_mode: bool
     entry_post_only: bool
     disable_new_entries_after_stop_hit: bool
@@ -41,6 +42,7 @@ def from_defaults(d: GlobalSettings) -> RuntimeSettings:
         market_list_refresh_seconds=d.market_list_refresh_seconds,
         rate_limit_backoff_seconds=d.rate_limit_backoff_seconds,
         rate_limit_backoff_max_seconds=d.rate_limit_backoff_max_seconds,
+        fallback_window_hours=d.fallback_window_hours,
         dry_run_mode=d.dry_run_mode,
         entry_post_only=d.entry_post_only,
         disable_new_entries_after_stop_hit=d.disable_new_entries_after_stop_hit,

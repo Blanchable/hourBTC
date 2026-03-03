@@ -46,6 +46,7 @@ def test_has_settings_tab_and_buttons(qapp, monkeypatch):
     assert w.btn_save_settings.text() == "Save Settings"
     assert w.btn_apply_settings.text() == "Apply to Running Bot"
     assert w.btn_reset_settings.text() == "Reset to Defaults"
+    assert w.s_fallback_window.text() != ""
 
 
 def test_validation_blocks_bad_settings(qapp, monkeypatch):
@@ -55,12 +56,27 @@ def test_validation_blocks_bad_settings(qapp, monkeypatch):
     assert "Market List Refresh" in w.logs.toPlainText()
 
 
+def test_validation_blocks_bad_fallback_window(qapp, monkeypatch):
+    w = _build(monkeypatch)
+    w.s_fallback_window.setText("0")
+    w.save_runtime_settings()
+    assert "Fallback window" in w.logs.toPlainText()
+
+
 def test_shadow_while_running_uses_cached_mode(qapp, monkeypatch):
     w = _build(monkeypatch)
     w.loop_running = True
+
     class W:
         def get_cached_shadow_context(self):
-            return {"rows": [{"ticker": "KXBTCD-A", "yes_bid": 1, "yes_ask": 2, "no_bid": 98, "no_ask": 99}], "target": {"ticker": "KXBTCD-A", "title": "Bitcoin price today at 1:00 AM?"}, "spot": 100000, "spot_age": 1.0, "quote_age": 1.0}
+            return {
+                "rows": [{"ticker": "KXBTCD-A", "yes_bid": 1, "yes_ask": 2, "no_bid": 98, "no_ask": 99}],
+                "target": {"ticker": "KXBTCD-A", "title": "Bitcoin price today at 1:00 AM?"},
+                "spot": 100000,
+                "spot_age": 1.0,
+                "quote_age": 1.0,
+            }
+
     w.worker = W()
     w.shadow_order_test()
     assert "Using cached shadow mode" in w.logs.toPlainText()

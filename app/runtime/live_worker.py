@@ -73,6 +73,7 @@ class LiveWorker(QObject):
             "spot": self.last_spot,
             "spot_age": self._spot_age(),
             "quote_age": self._quote_age(),
+            "diagnostics": self.client.last_series_diagnostics,
         }
 
     def _new_client_order_id(self, prefix: str, side: str) -> str:
@@ -166,18 +167,34 @@ class LiveWorker(QObject):
             self.error_signal.emit(f"Spot refresh failed: {exc}")
 
     def _refresh_market_snapshot(self) -> None:
-        markets = self.client.get_open_hourly_trade_markets_live()
+        now_dt = datetime.now(timezone.utc)
+        markets = self.client.get_live_candidate_trade_markets(
+            now=now_dt,
+            fallback_window_hours=self.runtime_settings.fallback_window_hours,
+            cache_ttl_seconds=self.runtime_settings.market_list_refresh_seconds,
+        )
         if not markets:
-            self.log_signal.emit("No open KXBTCD contracts found")
+            self.log_signal.emit("No live KXBTCD trade candidates found")
+            diag = self.client.last_series_diagnostics or {}
+            self.log_signal.emit(f"KXBTCD open query returned {diag.get('open_query_count', 0)} rows")
+            self.log_signal.emit(
+                f"KXBTCD fallback window returned {diag.get('fallback_query_count', 0)} rows, {diag.get('candidate_count', 0)} live candidates"
+            )
             self.series_rows_signal.emit([])
             self.last_rows = []
             self.last_target = None
             return
 
-        target = self.client.resolve_btc_hourly_trade_target_market(spot_price=self.last_spot, markets=markets)
+        target = self.client.resolve_btc_hourly_trade_target_market(now=now_dt, spot_price=self.last_spot, markets=markets)
         self.last_target = target
         self.selected_market_signal.emit(target.get("ticker", "") if target else "")
         self.selected_title_signal.emit(target.get("title", "") if target else "")
+
+        diag = self.client.last_series_diagnostics or {}
+        if diag.get("used_fallback"):
+            self.log_signal.emit("KXBTCD open query returned 0 rows; trying bounded fallback")
+            self.log_signal.emit(f"KXBTCD fallback window returned {diag.get('fallback_query_count', 0)} rows")
+            self.log_signal.emit(f"Live trade candidates after filtering: {diag.get('candidate_count', 0)}")
 
         selected_idx = 0
         if target:
@@ -193,6 +210,9 @@ class LiveWorker(QObject):
         self.last_rows = rows
         self.last_quote_ts = datetime.now(timezone.utc)
         self.log_signal.emit(f"Series quote refresh complete: {len(rows)} KXBTCD contracts updated")
+        if target:
+            self.log_signal.emit(f"Selected threshold target: {target.get('ticker')}")
+            self.log_signal.emit(f"Selected title: {target.get('title')}")
 
     def _evaluate_target_once(self) -> None:
         if not self.last_target:

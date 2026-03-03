@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 
 try:
@@ -6,8 +8,8 @@ except Exception as exc:  # pragma: no cover
     pytest.skip(f"PySide6 unavailable: {exc}", allow_module_level=True)
 
 from app.brokers.kalshi_client import KalshiRateLimitError
-from app.config.runtime_settings import from_defaults
 from app.config.defaults import settings
+from app.config.runtime_settings import from_defaults
 from app.core.controller import Controller
 from app.feeds.btc_feed import BTCFeed
 from app.runtime.live_worker import LiveWorker
@@ -24,20 +26,24 @@ class Spot:
 
 class Client:
     def __init__(self):
-        self.live_calls = 0
+        self.calls = []
         self.raise_429 = False
+        self.last_series_diagnostics = {}
 
-    def validate_hourly_series(self):
-        return {"ok": True, "ticker": "KXBTCD"}
-
-    def get_open_hourly_trade_markets_live(self, force_refresh=False):
-        self.live_calls += 1
+    def get_live_candidate_trade_markets(self, now=None, force_refresh=False, fallback_window_hours=None, cache_ttl_seconds=None):
+        self.calls.append(("live_candidates", fallback_window_hours, cache_ttl_seconds))
         if self.raise_429:
             raise KalshiRateLimitError("429")
+        self.last_series_diagnostics = {
+            "open_query_count": 0,
+            "fallback_query_count": 2,
+            "candidate_count": 1,
+            "used_fallback": True,
+        }
         return [{"ticker": "KXBTCD-A", "title": "Bitcoin price today at 1:00 AM?", "close_time": "2099-01-01T01:00:00Z"}]
 
     def resolve_btc_hourly_trade_target_market(self, now=None, spot_price=None, markets=None):
-        return markets[0]
+        return markets[0] if markets else None
 
     def get_hourly_series_quote_rows(self, markets):
         return [{"ticker": "KXBTCD-A", "title": markets[0]["title"], "close_time": markets[0]["close_time"], "yes_bid": 45, "yes_ask": 46, "no_bid": 54, "no_ask": 55}]
@@ -66,19 +72,42 @@ def _build():
     return worker, c
 
 
-def test_worker_uses_live_fetch_path_only():
+def test_worker_refresh_uses_candidate_path_and_runtime_settings():
     w, c = _build()
-    w.runtime_settings.market_list_refresh_seconds = 1
+    w.runtime_settings.fallback_window_hours = 3
+    w.runtime_settings.market_list_refresh_seconds = 77
     w._refresh_market_snapshot()
-    assert c.live_calls == 1
+    assert c.calls[0] == ("live_candidates", 3, 77)
 
 
-def test_worker_handles_429_with_backoff():
+def test_worker_logs_open_empty_fallback_and_selected_target():
+    w, _ = _build()
+    logs = []
+    w.log_signal.connect(logs.append)
+    w._refresh_market_snapshot()
+    assert any("open query returned 0 rows; trying bounded fallback" in m for m in logs)
+    assert any("fallback window returned 2 rows" in m for m in logs)
+    assert any("Selected threshold target: KXBTCD-A" in m for m in logs)
+
+
+def test_worker_logs_no_candidates_without_crash():
     w, c = _build()
     logs = []
     w.log_signal.connect(logs.append)
-    c.raise_429 = True
-    w._refresh_market_snapshot = lambda: (_ for _ in ()).throw(KalshiRateLimitError("429"))
+
+    def none_rows(**kwargs):
+        c.last_series_diagnostics = {"open_query_count": 0, "fallback_query_count": 0, "candidate_count": 0}
+        return []
+
+    c.get_live_candidate_trade_markets = none_rows
+    w._refresh_market_snapshot()
+    assert any("No live KXBTCD trade candidates found" in m for m in logs)
+
+
+def test_worker_handles_429_with_backoff():
+    w, _ = _build()
+    logs = []
+    w.log_signal.connect(logs.append)
     w._begin_backoff("429")
     assert any("Backing off" in m for m in logs)
 
@@ -88,12 +117,12 @@ def test_worker_dry_run_no_submit():
     w.runtime_settings.dry_run_mode = True
     w.last_rows = [{"ticker": "KXBTCD-A", "yes_bid": 45, "yes_ask": 46, "no_bid": 54, "no_ask": 55, "close_time": "2099-01-01T01:00:00Z"}]
     w.last_target = {"ticker": "KXBTCD-A"}
-    w.last_spot_ts = w.last_quote_ts = __import__('datetime').datetime.now(__import__('datetime').timezone.utc)
-    logs=[]
+    w.last_spot_ts = w.last_quote_ts = datetime.now(timezone.utc)
+    logs = []
     w.log_signal.connect(logs.append)
     w._evaluate_target_once()
     assert any("DRY RUN" in m for m in logs)
-    assert not hasattr(c, 'submitted')
+    assert not hasattr(c, "submitted")
 
 
 def test_apply_settings_to_running_changes_values():
