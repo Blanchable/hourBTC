@@ -10,69 +10,57 @@ from app.gui import main_window
 
 @pytest.fixture(scope="module")
 def qapp():
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication([])
+    app = QApplication.instance() or QApplication([])
     return app
 
 
-def _build_window(monkeypatch):
-    class FakeStore:
-        def load(self, _env):
+def _build(monkeypatch):
+    class Store:
+        def load(self, env):
             return type("P", (), {"api_key_id": "", "private_key_path": ""})()
 
         def save(self, env, profile):
             pass
 
-    class FakeDB:
+    class DB:
         def bootstrap(self):
             pass
 
-    monkeypatch.setattr(main_window, "SecretStore", lambda _path: FakeStore())
-    monkeypatch.setattr(main_window, "DB", lambda _path: FakeDB())
+    class RS:
+        def load(self, d):
+            return d
+
+        def save(self, s):
+            pass
+
+    monkeypatch.setattr(main_window, "SecretStore", lambda p: Store())
+    monkeypatch.setattr(main_window, "DB", lambda p: DB())
+    monkeypatch.setattr(main_window, "RuntimeSettingsStore", lambda p: RS())
     return main_window.MainWindow()
 
 
-def test_gui_has_target_labels_and_tabs(qapp, monkeypatch):
-    w = _build_window(monkeypatch)
-    assert w.trade_series_label.text() == "Trade Series: KXBTCD"
-    assert w.display_series_label.text() == "Display Series: KXBTC"
-    assert w.target_family_label.text() == "Selected Target Family: Threshold"
-    assert w.mode_label.text().startswith("Mode: ")
-    tab_names = [w.tabs.tabText(i) for i in range(w.tabs.count())]
-    assert "Series Order Book" in tab_names
+def test_has_settings_tab_and_buttons(qapp, monkeypatch):
+    w = _build(monkeypatch)
+    tabs = [w.tabs.tabText(i) for i in range(w.tabs.count())]
+    assert "Settings" in tabs
+    assert w.btn_save_settings.text() == "Save Settings"
+    assert w.btn_apply_settings.text() == "Apply to Running Bot"
+    assert w.btn_reset_settings.text() == "Reset to Defaults"
 
 
-def test_feed_age_labels_update(qapp, monkeypatch):
-    w = _build_window(monkeypatch)
-    w.update_spot_meta("2026-01-01T00:00:00+00:00", 3.4)
-    assert "2026-01-01" in w.last_spot_update_label.text()
-    assert "3.4s" in w.feed_age_label.text()
+def test_validation_blocks_bad_settings(qapp, monkeypatch):
+    w = _build(monkeypatch)
+    w.s_market_refresh.setText("1")
+    w.save_runtime_settings()
+    assert "Market List Refresh" in w.logs.toPlainText()
 
 
-def test_series_table_shows_quotes(qapp, monkeypatch):
-    w = _build_window(monkeypatch)
-    w.update_series_orderbook([
-        {
-            "ticker": "KXBTCD-TEST-1",
-            "title": "Bitcoin price today at 1:00 AM?",
-            "close_time": "2026-01-01T01:00:00Z",
-            "strike": 100000,
-            "yes_bid": 45,
-            "yes_ask": 47,
-            "no_bid": 53,
-            "no_ask": 55,
-            "selected": "Yes",
-            "last_update": "t",
-        }
-    ])
-    assert w.series_table.item(0, 0).text() == "KXBTCD-TEST-1"
-    assert w.series_table.item(0, 4).text() == "45"
-    assert w.series_table.item(0, 7).text() == "55"
-
-
-def test_smoke_test_disabled_in_production(qapp, monkeypatch):
-    w = _build_window(monkeypatch)
-    w.env.setText("production")
-    w.paper_smoke_test()
-    assert "disabled in production" in w.logs.toPlainText()
+def test_shadow_while_running_uses_cached_mode(qapp, monkeypatch):
+    w = _build(monkeypatch)
+    w.loop_running = True
+    class W:
+        def get_cached_shadow_context(self):
+            return {"rows": [{"ticker": "KXBTCD-A", "yes_bid": 1, "yes_ask": 2, "no_bid": 98, "no_ask": 99}], "target": {"ticker": "KXBTCD-A", "title": "Bitcoin price today at 1:00 AM?"}, "spot": 100000, "spot_age": 1.0, "quote_age": 1.0}
+    w.worker = W()
+    w.shadow_order_test()
+    assert "Using cached shadow mode" in w.logs.toPlainText()

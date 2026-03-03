@@ -42,6 +42,9 @@ class GlobalSettings:
     max_api_errors_per_session: int = 3
     max_consecutive_loop_errors: int = 3
     quote_stale_stop_seconds: int = 10
+    market_list_refresh_seconds: int = 45
+    rate_limit_backoff_seconds: int = 10
+    rate_limit_backoff_max_seconds: int = 30
     disable_new_entries_after_stop_hit: bool = True
 
     # Operational controls
