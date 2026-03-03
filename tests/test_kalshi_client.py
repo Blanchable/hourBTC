@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
-from app.brokers.kalshi_client import BTC_1H_SERIES_TICKER, KalshiClient, parse_btc_threshold
+import pytest
+
+from app.brokers.kalshi_client import BTC_1H_SERIES_TICKER, KalshiClient, KalshiRequestError, parse_btc_threshold
 
 
 class FakeClient(KalshiClient):
@@ -82,3 +84,58 @@ def test_get_open_hourly_series_markets_status_fallback_filters():
     assert c.last_series_diagnostics["open_count"] == 0
     assert c.last_series_diagnostics["fallback_count"] == 3
     assert c.last_series_diagnostics["tradable_count"] == 1
+
+
+def test_place_limit_order_payload_yes_no_fields():
+    class ReqClient(FakeClient):
+        def _request(self, method: str, path: str, body=None):
+            return {"method": method, "path": path, "body": body}
+
+    c = ReqClient()
+    yes = c.place_limit_order("T", "yes", "buy", 1, 25, "id1")
+    no = c.place_limit_order("T", "no", "sell", 1, 77, "id2")
+
+    assert yes["body"]["action"] == "buy"
+    assert yes["body"]["yes_price"] == 25
+    assert "no_price" not in yes["body"]
+
+    assert no["body"]["action"] == "sell"
+    assert no["body"]["no_price"] == 77
+    assert "yes_price" not in no["body"]
+
+
+def test_request_error_contains_status_and_body():
+    class FakeResp:
+        status_code = 400
+        text = "bad request body"
+
+        def raise_for_status(self):
+            raise RuntimeError("boom")
+
+    class FakeHTTP:
+        def request(self, *args, **kwargs):
+            return FakeResp()
+
+    c = FakeClient()
+    c.http = FakeHTTP()
+    c._auth_headers = lambda method, path, body="": {}
+
+    with pytest.raises(KalshiRequestError) as exc:
+        c._request("GET", "/x")
+    msg = str(exc.value)
+    assert "status=400" in msg
+    assert "bad request body" in msg
+
+
+def test_place_entry_and_exit_wrappers():
+    class ReqClient(FakeClient):
+        def _request(self, method: str, path: str, body=None):
+            return {"body": body}
+
+    c = ReqClient()
+    entry = c.place_entry_order("T", "yes", 1, 22, "e1", post_only=True)
+    exit_o = c.place_exit_order("T", "no", 1, 70, "x1")
+
+    assert entry["body"]["action"] == "buy"
+    assert exit_o["body"]["action"] == "sell"
+    assert exit_o["body"]["reduce_only"] is True

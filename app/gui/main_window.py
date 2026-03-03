@@ -353,11 +353,16 @@ class MainWindow(QMainWindow):
             self.set_disconnected_state(f"Connection failed: {exc}")
 
     def stop_bot(self) -> None:
+        if not self.loop_running and not self.worker_thread:
+            return
+        self.append_log("Stop requested by user")
         if self.worker:
             self.worker.stop()
         if self.worker_thread:
             self.worker_thread.quit()
-            self.worker_thread.wait(3000)
+            self.worker_thread.wait(5000)
+        if self.worker:
+            self.worker.shutdown_cleanup()
         self.worker = None
         self.worker_thread = None
         self.loop_running = False
@@ -366,8 +371,9 @@ class MainWindow(QMainWindow):
         self.set_loop_status("Loop: stopped")
         if self.client:
             self.client.close()
-        self.set_disconnected_state("Bot stopped by user")
-        self.append_log("Bot stopped")
+            self.client = None
+        self.set_disconnected_state()
+        self.append_log("Live loop stopped")
 
     def closeEvent(self, event):  # noqa: N802
         self.stop_bot()

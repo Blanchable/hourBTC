@@ -32,6 +32,10 @@ ENVIRONMENTS = {
 }
 
 
+class KalshiRequestError(RuntimeError):
+    pass
+
+
 class KalshiClient:
     def __init__(self, environment: str, api_key_id: str, private_key_path: str):
         self.environment = ENVIRONMENTS[environment]
@@ -68,7 +72,11 @@ class KalshiClient:
         if self.http is None:
             raise RuntimeError("httpx dependency missing")
         resp = self.http.request(method, path, headers=headers, content=text if text else None)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except Exception as exc:
+            msg = f"Kalshi request failed: {method} {path} status={getattr(resp, 'status_code', 'unknown')} body={resp.text}"
+            raise KalshiRequestError(msg) from exc
         return resp.json()
 
     def connect(self) -> dict:
@@ -81,8 +89,28 @@ class KalshiClient:
     def get_account_summary(self) -> dict:
         return self._request("GET", "/trade-api/v2/portfolio/balance")
 
-    def get_open_orders(self) -> dict:
-        return self._request("GET", "/trade-api/v2/portfolio/orders?status=open")
+    def get_orders(self, status: str | None = None, ticker: str | None = None) -> dict:
+        cursor = None
+        rows = []
+        while True:
+            query = {"limit": 100}
+            if status:
+                query["status"] = status
+            if ticker:
+                query["ticker"] = ticker
+            if cursor:
+                query["cursor"] = cursor
+            payload = self._request("GET", f"/trade-api/v2/portfolio/orders?{urlencode(query)}")
+            batch = payload.get("orders", [])
+            if isinstance(batch, list):
+                rows.extend(batch)
+            cursor = payload.get("cursor")
+            if not cursor:
+                break
+        return {"orders": rows}
+
+    def get_open_orders(self, status: str = "resting") -> dict:
+        return self.get_orders(status=status)
 
     def get_order_status(self, order_id: str) -> dict:
         return self._request("GET", f"/trade-api/v2/portfolio/orders/{order_id}")
@@ -90,19 +118,96 @@ class KalshiClient:
     def cancel_order(self, order_id: str) -> dict:
         return self._request("DELETE", f"/trade-api/v2/portfolio/orders/{order_id}")
 
-    def place_limit_order(self, ticker: str, side: str, count: int, limit_price: int, client_order_id: str) -> dict:
-        return self._request(
-            "POST",
-            "/trade-api/v2/portfolio/orders",
-            {
-                "ticker": ticker,
-                "side": side,
-                "type": "limit",
-                "count": count,
-                "yes_price": limit_price if side == "yes" else None,
-                "no_price": limit_price if side == "no" else None,
-                "client_order_id": client_order_id,
-            },
+    def place_limit_order(
+        self,
+        ticker: str,
+        side: str,
+        action: str,
+        count: int,
+        limit_price: int,
+        client_order_id: str,
+        *,
+        post_only: bool = False,
+        time_in_force: str | None = None,
+        reduce_only: bool = False,
+        expiration_ts: int | None = None,
+        cancel_order_on_pause: bool = True,
+    ) -> dict:
+        payload = {
+            "ticker": ticker,
+            "side": side,
+            "action": action,
+            "type": "limit",
+            "count": count,
+            "client_order_id": client_order_id,
+            "post_only": post_only,
+            "reduce_only": reduce_only,
+            "cancel_order_on_pause": cancel_order_on_pause,
+        }
+        if side == "yes":
+            payload["yes_price"] = limit_price
+        elif side == "no":
+            payload["no_price"] = limit_price
+        else:
+            raise ValueError("side must be 'yes' or 'no'")
+        if time_in_force:
+            payload["time_in_force"] = time_in_force
+        if expiration_ts is not None:
+            payload["expiration_ts"] = expiration_ts
+        return self._request("POST", "/trade-api/v2/portfolio/orders", payload)
+
+    def place_entry_order(
+        self,
+        ticker: str,
+        side: str,
+        count: int,
+        limit_price: int,
+        client_order_id: str,
+        *,
+        post_only: bool = True,
+        time_in_force: str | None = "good_till_canceled",
+        expiration_ts: int | None = None,
+        cancel_order_on_pause: bool = True,
+    ) -> dict:
+        return self.place_limit_order(
+            ticker=ticker,
+            side=side,
+            action="buy",
+            count=count,
+            limit_price=limit_price,
+            client_order_id=client_order_id,
+            post_only=post_only,
+            time_in_force=time_in_force,
+            reduce_only=False,
+            expiration_ts=expiration_ts,
+            cancel_order_on_pause=cancel_order_on_pause,
+        )
+
+    def place_exit_order(
+        self,
+        ticker: str,
+        side: str,
+        count: int,
+        limit_price: int,
+        client_order_id: str,
+        *,
+        time_in_force: str | None = "immediate_or_cancel",
+        reduce_only: bool = True,
+        expiration_ts: int | None = None,
+        cancel_order_on_pause: bool = True,
+    ) -> dict:
+        return self.place_limit_order(
+            ticker=ticker,
+            side=side,
+            action="sell",
+            count=count,
+            limit_price=limit_price,
+            client_order_id=client_order_id,
+            post_only=False,
+            time_in_force=time_in_force,
+            reduce_only=reduce_only,
+            expiration_ts=expiration_ts,
+            cancel_order_on_pause=cancel_order_on_pause,
         )
 
     def get_orderbook_snapshot(self, ticker: str) -> dict:
