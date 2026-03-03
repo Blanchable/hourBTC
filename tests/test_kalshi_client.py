@@ -26,3 +26,23 @@ def test_fallback_market_resolution():
     c = FakeClient()
     m = c.resolve_btc_target_market()
     assert m["ticker"] == "X"
+
+
+def test_extract_best_prices_happy_path():
+    orderbook = {
+        "yes": {"bids": [{"price": 45}], "asks": [{"price": 47}]},
+        "no": {"bids": [{"price": 53}], "asks": [{"price": 55}]},
+    }
+    out = KalshiClient.extract_best_prices(orderbook)
+    assert out == {"yes_bid": 45.0, "yes_ask": 47.0, "no_bid": 53.0, "no_ask": 55.0}
+
+
+def test_extract_best_prices_missing_or_malformed():
+    out = KalshiClient.extract_best_prices({"yes": {"bids": []}, "no": {"asks": []}})
+    assert out["yes_bid"] is None
+    assert out["yes_ask"] is None
+    assert out["no_bid"] is None
+    assert out["no_ask"] is None
+
+    out2 = KalshiClient.extract_best_prices({"bad": "shape"})
+    assert out2 == {"yes_bid": None, "yes_ask": None, "no_bid": None, "no_ask": None}

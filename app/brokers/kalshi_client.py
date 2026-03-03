@@ -72,6 +72,10 @@ class KalshiClient:
     def connect(self) -> dict:
         return self.get_account_summary()
 
+    def close(self) -> None:
+        if self.http is not None:
+            self.http.close()
+
     def get_account_summary(self) -> dict:
         return self._request("GET", "/trade-api/v2/portfolio/balance")
 
@@ -107,6 +111,81 @@ class KalshiClient:
 
     def list_open_markets(self) -> dict:
         return self._request("GET", "/trade-api/v2/markets?status=open")
+
+    def get_open_hourly_series_markets(self) -> list[dict]:
+        markets = self.list_series_markets().get("markets", [])
+        return sorted(markets, key=lambda m: (m.get("close_time", ""), m.get("ticker", "")))
+
+    @staticmethod
+    def extract_best_prices(orderbook: dict) -> dict:
+        def _price_from_level(level):
+            if isinstance(level, dict):
+                for key in ("price", "yes_price", "no_price", "value"):
+                    if key in level and level[key] is not None:
+                        try:
+                            return float(level[key])
+                        except (TypeError, ValueError):
+                            return None
+            if isinstance(level, (list, tuple)) and level:
+                try:
+                    return float(level[0])
+                except (TypeError, ValueError):
+                    return None
+            return None
+
+        def _extract_list(root: dict, direct_key: str, nested_key: str, side_name: str):
+            direct = root.get(direct_key)
+            if isinstance(direct, list):
+                return direct
+            side = root.get(side_name)
+            if isinstance(side, dict) and isinstance(side.get(nested_key), list):
+                return side.get(nested_key)
+            return []
+
+        def _best(levels: list, mode: str):
+            prices = [p for p in (_price_from_level(level) for level in levels) if p is not None]
+            if not prices:
+                return None
+            return max(prices) if mode == "bid" else min(prices)
+
+        root = orderbook.get("orderbook", orderbook) if isinstance(orderbook, dict) else {}
+        yes_bids = _extract_list(root, "yes_bids", "bids", "yes")
+        yes_asks = _extract_list(root, "yes_asks", "asks", "yes")
+        no_bids = _extract_list(root, "no_bids", "bids", "no")
+        no_asks = _extract_list(root, "no_asks", "asks", "no")
+
+        if not yes_bids and isinstance(root.get("yes"), list):
+            yes_bids = root.get("yes", [])
+        if not no_bids and isinstance(root.get("no"), list):
+            no_bids = root.get("no", [])
+
+        return {
+            "yes_bid": _best(yes_bids, "bid"),
+            "yes_ask": _best(yes_asks, "ask"),
+            "no_bid": _best(no_bids, "bid"),
+            "no_ask": _best(no_asks, "ask"),
+        }
+
+    def get_hourly_series_quote_rows(self) -> list[dict]:
+        rows = []
+        for market in self.get_open_hourly_series_markets():
+            ticker = market.get("ticker", "")
+            try:
+                orderbook = self.get_orderbook_snapshot(ticker)
+                best = self.extract_best_prices(orderbook)
+            except Exception:
+                best = {"yes_bid": None, "yes_ask": None, "no_bid": None, "no_ask": None}
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "title": market.get("title", ""),
+                    "close_time": market.get("close_time", ""),
+                    "strike": parse_btc_threshold(market),
+                    **best,
+                    "last_update": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        return rows
 
     def resolve_btc_target_market(self) -> Optional[dict]:
         data = self.list_series_markets().get("markets", [])
