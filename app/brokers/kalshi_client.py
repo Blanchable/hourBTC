@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlencode
 
 try:
     import httpx
@@ -16,7 +17,7 @@ try:
 except Exception:  # pragma: no cover
     hashes = serialization = padding = None
 
-BTC_1H_SERIES_TICKER = "KXBTC1H"
+BTC_1H_SERIES_TICKER = "KXBTC"
 
 
 @dataclass
@@ -37,6 +38,7 @@ class KalshiClient:
         self.api_key_id = api_key_id
         self.private_key_path = private_key_path
         self.http = httpx.Client(base_url=self.environment.base_url, timeout=10) if httpx else None
+        self.last_series_diagnostics: dict = {}
 
     def _sign(self, message: bytes) -> str:
         if not serialization or not padding or not hashes:
@@ -106,94 +108,167 @@ class KalshiClient:
     def get_orderbook_snapshot(self, ticker: str) -> dict:
         return self._request("GET", f"/trade-api/v2/markets/{ticker}/orderbook")
 
+    def _get_all_markets_for_series(self, series_ticker: str, status: str | None = None) -> list[dict]:
+        cursor: str | None = None
+        rows: list[dict] = []
+        while True:
+            query = {"series_ticker": series_ticker, "limit": 100}
+            if status:
+                query["status"] = status
+            if cursor:
+                query["cursor"] = cursor
+            path = f"/trade-api/v2/markets?{urlencode(query)}"
+            payload = self._request("GET", path)
+            markets = payload.get("markets", [])
+            if isinstance(markets, list):
+                rows.extend(markets)
+            cursor = payload.get("cursor")
+            if not cursor:
+                break
+        return rows
+
     def list_series_markets(self) -> dict:
-        return self._request("GET", f"/trade-api/v2/markets?series_ticker={BTC_1H_SERIES_TICKER}&status=open")
+        return {"markets": self._get_all_markets_for_series(BTC_1H_SERIES_TICKER, status="open")}
 
     def list_open_markets(self) -> dict:
         return self._request("GET", "/trade-api/v2/markets?status=open")
 
+    def validate_hourly_series(self) -> dict:
+        try:
+            self._request("GET", f"/trade-api/v2/series/{BTC_1H_SERIES_TICKER}")
+            return {"ok": True, "ticker": BTC_1H_SERIES_TICKER}
+        except Exception as exc:
+            return {"ok": False, "ticker": BTC_1H_SERIES_TICKER, "error": str(exc)}
+
+    def _is_tradable_series_market(self, market: dict) -> bool:
+        status = str(market.get("status", "")).lower()
+        if status and status not in {"open", "active", "initialized", "paused"}:
+            return False
+        close = market.get("close_time")
+        if close:
+            try:
+                close_dt = datetime.fromisoformat(close.replace("Z", "+00:00"))
+                if close_dt <= datetime.now(timezone.utc):
+                    return False
+            except Exception:
+                pass
+        return True
+
     def get_open_hourly_series_markets(self) -> list[dict]:
-        markets = self.list_series_markets().get("markets", [])
-        return sorted(markets, key=lambda m: (m.get("close_time", ""), m.get("ticker", "")))
+        open_rows = self._get_all_markets_for_series(BTC_1H_SERIES_TICKER, status="open")
+        if open_rows:
+            self.last_series_diagnostics = {
+                "series_ticker": BTC_1H_SERIES_TICKER,
+                "open_count": len(open_rows),
+                "fallback_count": 0,
+                "tradable_count": len(open_rows),
+                "used_fallback": False,
+            }
+            return sorted(open_rows, key=lambda m: (m.get("close_time", ""), m.get("ticker", "")))
+
+        fallback_rows = self._get_all_markets_for_series(BTC_1H_SERIES_TICKER, status=None)
+        tradable = [m for m in fallback_rows if self._is_tradable_series_market(m)]
+        self.last_series_diagnostics = {
+            "series_ticker": BTC_1H_SERIES_TICKER,
+            "open_count": 0,
+            "fallback_count": len(fallback_rows),
+            "tradable_count": len(tradable),
+            "used_fallback": True,
+        }
+        return sorted(tradable, key=lambda m: (m.get("close_time", ""), m.get("ticker", "")))
 
     @staticmethod
     def extract_best_prices(orderbook: dict) -> dict:
         def _price_from_level(level):
-            if isinstance(level, dict):
-                for key in ("price", "yes_price", "no_price", "value"):
-                    if key in level and level[key] is not None:
-                        try:
-                            return float(level[key])
-                        except (TypeError, ValueError):
-                            return None
             if isinstance(level, (list, tuple)) and level:
                 try:
                     return float(level[0])
                 except (TypeError, ValueError):
                     return None
+            if isinstance(level, dict):
+                for key in ("price", "yes_price", "no_price", "value"):
+                    if level.get(key) is not None:
+                        try:
+                            return float(level[key])
+                        except (TypeError, ValueError):
+                            return None
             return None
 
-        def _extract_list(root: dict, direct_key: str, nested_key: str, side_name: str):
-            direct = root.get(direct_key)
-            if isinstance(direct, list):
-                return direct
-            side = root.get(side_name)
-            if isinstance(side, dict) and isinstance(side.get(nested_key), list):
-                return side.get(nested_key)
-            return []
-
-        def _best(levels: list, mode: str):
-            prices = [p for p in (_price_from_level(level) for level in levels) if p is not None]
-            if not prices:
+        def _best_bid(levels):
+            if not isinstance(levels, list):
                 return None
-            return max(prices) if mode == "bid" else min(prices)
+            prices = [p for p in (_price_from_level(level) for level in levels) if p is not None and 0 <= p <= 100]
+            return max(prices) if prices else None
 
         root = orderbook.get("orderbook", orderbook) if isinstance(orderbook, dict) else {}
-        yes_bids = _extract_list(root, "yes_bids", "bids", "yes")
-        yes_asks = _extract_list(root, "yes_asks", "asks", "yes")
-        no_bids = _extract_list(root, "no_bids", "bids", "no")
-        no_asks = _extract_list(root, "no_asks", "asks", "no")
+        yes_levels = root.get("yes")
+        no_levels = root.get("no")
+        if yes_levels is None and isinstance(root.get("yes_bids"), list):
+            yes_levels = root.get("yes_bids")
+        if no_levels is None and isinstance(root.get("no_bids"), list):
+            no_levels = root.get("no_bids")
 
-        if not yes_bids and isinstance(root.get("yes"), list):
-            yes_bids = root.get("yes", [])
-        if not no_bids and isinstance(root.get("no"), list):
-            no_bids = root.get("no", [])
+        yes_bid = _best_bid(yes_levels)
+        no_bid = _best_bid(no_levels)
+
+        yes_ask = (100 - no_bid) if no_bid is not None else None
+        no_ask = (100 - yes_bid) if yes_bid is not None else None
+
+        if yes_ask is not None and not (0 <= yes_ask <= 100):
+            yes_ask = None
+        if no_ask is not None and not (0 <= no_ask <= 100):
+            no_ask = None
 
         return {
-            "yes_bid": _best(yes_bids, "bid"),
-            "yes_ask": _best(yes_asks, "ask"),
-            "no_bid": _best(no_bids, "bid"),
-            "no_ask": _best(no_asks, "ask"),
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "no_bid": no_bid,
+            "no_ask": no_ask,
         }
 
     def get_hourly_series_quote_rows(self) -> list[dict]:
         rows = []
         for market in self.get_open_hourly_series_markets():
             ticker = market.get("ticker", "")
+            best = {"yes_bid": None, "yes_ask": None, "no_bid": None, "no_ask": None}
+            error = None
             try:
                 orderbook = self.get_orderbook_snapshot(ticker)
                 best = self.extract_best_prices(orderbook)
-            except Exception:
-                best = {"yes_bid": None, "yes_ask": None, "no_bid": None, "no_ask": None}
+            except Exception as exc:
+                error = str(exc)
             rows.append(
                 {
                     "ticker": ticker,
                     "title": market.get("title", ""),
                     "close_time": market.get("close_time", ""),
                     "strike": parse_btc_threshold(market),
+                    "status": market.get("status", ""),
+                    "event_ticker": market.get("event_ticker", ""),
                     **best,
                     "last_update": datetime.now(timezone.utc).isoformat(),
+                    "error": error,
                 }
             )
         return rows
 
     def resolve_btc_target_market(self) -> Optional[dict]:
-        data = self.list_series_markets().get("markets", [])
-        if data:
-            return sorted(data, key=lambda m: m.get("close_time", ""))[0]
+        series_rows = self.get_open_hourly_series_markets()
+        if series_rows:
+            return series_rows[0]
+
         fallback = self.list_open_markets().get("markets", [])
-        hourly = [m for m in fallback if "BTC" in m.get("title", "") and self._close_minute(m) == 0]
-        return sorted(hourly, key=lambda m: m.get("close_time", ""))[0] if hourly else None
+        candidates = []
+        for market in fallback:
+            title = market.get("title", "")
+            if "BTC" not in title.upper():
+                continue
+            if self._close_minute(market) != 0:
+                continue
+            if not self._is_tradable_series_market(market):
+                continue
+            candidates.append(market)
+        return sorted(candidates, key=lambda m: (m.get("close_time", ""), m.get("ticker", "")))[0] if candidates else None
 
     def _close_minute(self, market: dict) -> int:
         close = market.get("close_time")

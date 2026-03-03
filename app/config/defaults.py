@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 @dataclass
 class GlobalSettings:
     strategy_mode: str = "1h"
-    btc_1h_series_ticker: str = "KXBTC1H"
+    btc_1h_series_ticker: str = "KXBTC"
     spread_filter_cents: int = 3
     min_price_cents: int = 15
     max_price_cents: int = 85

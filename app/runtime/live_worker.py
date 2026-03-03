@@ -5,7 +5,7 @@ from typing import Any
 
 from PySide6.QtCore import QObject, Signal
 
-from app.brokers.kalshi_client import KalshiClient
+from app.brokers.kalshi_client import BTC_1H_SERIES_TICKER, KalshiClient
 from app.core.controller import Controller
 from app.feeds.btc_feed import BTCFeed
 from app.feeds.spot_client import SpotClient
@@ -102,6 +102,13 @@ class LiveWorker(QObject):
         self.loop_status_signal.emit("Loop: running")
         self.log_signal.emit("Live loop started")
         self._log_event("loop_started", {})
+        validation = self.client.validate_hourly_series()
+        if validation.get("ok"):
+            self.log_signal.emit(f"Hourly series validated: {validation.get('ticker')}")
+        else:
+            self.error_signal.emit(
+                f"Hourly series validation failed for {validation.get('ticker')}: {validation.get('error', 'unknown error')}"
+            )
         while self._running:
             self.run_cycle()
             time.sleep(1)
@@ -151,7 +158,15 @@ class LiveWorker(QObject):
         try:
             rows = self.client.get_hourly_series_quote_rows()
             if not rows:
-                self.log_signal.emit("No open KXBTC1H contracts found")
+                self.log_signal.emit(f"No open {BTC_1H_SERIES_TICKER} contracts found")
+                diag = getattr(self.client, "last_series_diagnostics", {}) or {}
+                open_count = diag.get("open_count", 0)
+                fallback_count = diag.get("fallback_count", 0)
+                tradable_count = diag.get("tradable_count", 0)
+                self.log_signal.emit(f"{BTC_1H_SERIES_TICKER} open query returned {open_count} rows")
+                self.log_signal.emit(
+                    f"{BTC_1H_SERIES_TICKER} no-status query returned {fallback_count} rows, {tradable_count} currently tradable"
+                )
                 self.series_rows_signal.emit([])
                 return []
             selected = self.client.resolve_btc_target_market()
@@ -160,7 +175,11 @@ class LiveWorker(QObject):
             for row in rows:
                 row["selected"] = "Yes" if selected_ticker and row.get("ticker") == selected_ticker else ""
             self.series_rows_signal.emit(rows)
-            self.log_signal.emit(f"Series quote refresh complete: {len(rows)} contracts updated")
+            self.log_signal.emit(
+                f"Series quote refresh complete: {len(rows)} {BTC_1H_SERIES_TICKER} contracts updated"
+            )
+            if selected_ticker:
+                self.log_signal.emit(f"Selected target market: {selected_ticker}")
             self._log_event("series_refreshed", {"count": len(rows)})
             return rows
         except Exception as exc:

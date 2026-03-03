@@ -51,7 +51,7 @@ def test_series_table_update(qapp, monkeypatch):
     w.update_series_orderbook(
         [
             {
-                "ticker": "KXBTC1H-1",
+                "ticker": "KXBTC-TEST-1",
                 "title": "BTC above 100k",
                 "close_time": "2026-01-01T10:00:00Z",
                 "strike": 100000,
@@ -65,7 +65,7 @@ def test_series_table_update(qapp, monkeypatch):
         ]
     )
     assert w.series_table.rowCount() == 1
-    assert w.series_table.item(0, 0).text() == "KXBTC1H-1"
+    assert w.series_table.item(0, 0).text() == "KXBTC-TEST-1"
     assert w.series_table.item(0, 4).text() == "45"
     assert w.series_table.item(0, 7).text() == "55"
 
