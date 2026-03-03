@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 @dataclass
 class GlobalSettings:
     strategy_mode: str = "1h"
-    btc_1h_series_ticker: str = "KXBTC"
+    btc_hourly_trade_series_ticker: str = "KXBTCD"
+    btc_hourly_range_series_ticker: str = "KXBTC"
     spread_filter_cents: int = 3
     min_price_cents: int = 15
     max_price_cents: int = 85
@@ -28,6 +29,7 @@ class GlobalSettings:
 
     # Order behavior
     entry_post_only: bool = True
+    dry_run_mode: bool = True
     entry_time_in_force: str = "good_till_canceled"
     entry_order_timeout_seconds: int = 15
     exit_time_in_force: str = "immediate_or_cancel"

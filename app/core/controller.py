@@ -11,6 +11,7 @@ class AppState:
     market_ticker: str = ""
     strike: float | None = None
     last_decision: str = "idle"
+    market_title: str = ""
 
 
 class Controller:
@@ -23,12 +24,13 @@ class Controller:
         self.client.connect()
         self.state.connected = True
 
-    def refresh_market(self) -> None:
-        market = self.client.resolve_btc_target_market()
+    def refresh_market(self, spot_price: float | None = None) -> None:
+        market = self.client.resolve_btc_hourly_trade_target_market(spot_price=spot_price)
         if not market:
             self.state.last_decision = "no_market"
             return
         self.state.market_ticker = market["ticker"]
+        self.state.market_title = market.get("title", "")
         self.state.strike = parse_btc_threshold(market)
 
     def evaluate(self, quote: dict, seconds_to_expiry: int) -> str:

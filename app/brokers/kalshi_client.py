@@ -2,9 +2,11 @@ import base64
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlencode
+
+from app.config.defaults import settings
 
 try:
     import httpx
@@ -17,7 +19,8 @@ try:
 except Exception:  # pragma: no cover
     hashes = serialization = padding = None
 
-BTC_1H_SERIES_TICKER = "KXBTC"
+BTC_HOURLY_TRADE_SERIES_TICKER = "KXBTCD"
+BTC_HOURLY_RANGE_SERIES_TICKER = "KXBTC"
 
 
 @dataclass
@@ -75,8 +78,9 @@ class KalshiClient:
         try:
             resp.raise_for_status()
         except Exception as exc:
-            msg = f"Kalshi request failed: {method} {path} status={getattr(resp, 'status_code', 'unknown')} body={resp.text}"
-            raise KalshiRequestError(msg) from exc
+            raise KalshiRequestError(
+                f"Kalshi request failed: {method} {path} status={getattr(resp, 'status_code', 'unknown')} body={resp.text}"
+            ) from exc
         return resp.json()
 
     def connect(self) -> dict:
@@ -101,9 +105,7 @@ class KalshiClient:
             if cursor:
                 query["cursor"] = cursor
             payload = self._request("GET", f"/trade-api/v2/portfolio/orders?{urlencode(query)}")
-            batch = payload.get("orders", [])
-            if isinstance(batch, list):
-                rows.extend(batch)
+            rows.extend(payload.get("orders", []))
             cursor = payload.get("cursor")
             if not cursor:
                 break
@@ -149,101 +151,37 @@ class KalshiClient:
         elif side == "no":
             payload["no_price"] = limit_price
         else:
-            raise ValueError("side must be 'yes' or 'no'")
+            raise ValueError("side must be yes or no")
         if time_in_force:
             payload["time_in_force"] = time_in_force
         if expiration_ts is not None:
             payload["expiration_ts"] = expiration_ts
         return self._request("POST", "/trade-api/v2/portfolio/orders", payload)
 
-    def place_entry_order(
-        self,
-        ticker: str,
-        side: str,
-        count: int,
-        limit_price: int,
-        client_order_id: str,
-        *,
-        post_only: bool = True,
-        time_in_force: str | None = "good_till_canceled",
-        expiration_ts: int | None = None,
-        cancel_order_on_pause: bool = True,
-    ) -> dict:
-        return self.place_limit_order(
-            ticker=ticker,
-            side=side,
-            action="buy",
-            count=count,
-            limit_price=limit_price,
-            client_order_id=client_order_id,
-            post_only=post_only,
-            time_in_force=time_in_force,
-            reduce_only=False,
-            expiration_ts=expiration_ts,
-            cancel_order_on_pause=cancel_order_on_pause,
-        )
+    def place_entry_order(self, ticker: str, side: str, count: int, limit_price: int, client_order_id: str, **kwargs) -> dict:
+        return self.place_limit_order(ticker, side, "buy", count, limit_price, client_order_id, **kwargs)
 
-    def place_exit_order(
-        self,
-        ticker: str,
-        side: str,
-        count: int,
-        limit_price: int,
-        client_order_id: str,
-        *,
-        time_in_force: str | None = "immediate_or_cancel",
-        reduce_only: bool = True,
-        expiration_ts: int | None = None,
-        cancel_order_on_pause: bool = True,
-    ) -> dict:
-        return self.place_limit_order(
-            ticker=ticker,
-            side=side,
-            action="sell",
-            count=count,
-            limit_price=limit_price,
-            client_order_id=client_order_id,
-            post_only=False,
-            time_in_force=time_in_force,
-            reduce_only=reduce_only,
-            expiration_ts=expiration_ts,
-            cancel_order_on_pause=cancel_order_on_pause,
-        )
+    def place_exit_order(self, ticker: str, side: str, count: int, limit_price: int, client_order_id: str, **kwargs) -> dict:
+        return self.place_limit_order(ticker, side, "sell", count, limit_price, client_order_id, reduce_only=True, **kwargs)
 
     def get_orderbook_snapshot(self, ticker: str) -> dict:
         return self._request("GET", f"/trade-api/v2/markets/{ticker}/orderbook")
 
     def _get_all_markets_for_series(self, series_ticker: str, status: str | None = None) -> list[dict]:
-        cursor: str | None = None
-        rows: list[dict] = []
+        cursor = None
+        rows = []
         while True:
             query = {"series_ticker": series_ticker, "limit": 100}
             if status:
                 query["status"] = status
             if cursor:
                 query["cursor"] = cursor
-            path = f"/trade-api/v2/markets?{urlencode(query)}"
-            payload = self._request("GET", path)
-            markets = payload.get("markets", [])
-            if isinstance(markets, list):
-                rows.extend(markets)
+            payload = self._request("GET", f"/trade-api/v2/markets?{urlencode(query)}")
+            rows.extend(payload.get("markets", []))
             cursor = payload.get("cursor")
             if not cursor:
                 break
         return rows
-
-    def list_series_markets(self) -> dict:
-        return {"markets": self._get_all_markets_for_series(BTC_1H_SERIES_TICKER, status="open")}
-
-    def list_open_markets(self) -> dict:
-        return self._request("GET", "/trade-api/v2/markets?status=open")
-
-    def validate_hourly_series(self) -> dict:
-        try:
-            self._request("GET", f"/trade-api/v2/series/{BTC_1H_SERIES_TICKER}")
-            return {"ok": True, "ticker": BTC_1H_SERIES_TICKER}
-        except Exception as exc:
-            return {"ok": False, "ticker": BTC_1H_SERIES_TICKER, "error": str(exc)}
 
     def _is_tradable_series_market(self, market: dict) -> bool:
         status = str(market.get("status", "")).lower()
@@ -252,96 +190,138 @@ class KalshiClient:
         close = market.get("close_time")
         if close:
             try:
-                close_dt = datetime.fromisoformat(close.replace("Z", "+00:00"))
-                if close_dt <= datetime.now(timezone.utc):
+                if datetime.fromisoformat(close.replace("Z", "+00:00")) <= datetime.now(timezone.utc):
                     return False
             except Exception:
                 pass
         return True
 
-    def get_open_hourly_series_markets(self) -> list[dict]:
-        open_rows = self._get_all_markets_for_series(BTC_1H_SERIES_TICKER, status="open")
-        if open_rows:
+    def is_threshold_hourly_btc_market(self, row: dict) -> bool:
+        title = str(row.get("title", "")).lower()
+        return "bitcoin price today at" in title and "range" not in title
+
+    def is_range_hourly_btc_market(self, row: dict) -> bool:
+        return "bitcoin price range" in str(row.get("title", "")).lower()
+
+    def get_open_hourly_trade_markets(self) -> list[dict]:
+        series = settings.global_settings.btc_hourly_trade_series_ticker
+        open_rows = self._get_all_markets_for_series(series, status="open")
+        candidates = [r for r in open_rows if self.is_threshold_hourly_btc_market(r) and self._is_tradable_series_market(r)]
+        if not candidates:
+            fallback = self._get_all_markets_for_series(series, status=None)
+            candidates = [r for r in fallback if self.is_threshold_hourly_btc_market(r) and self._is_tradable_series_market(r)]
             self.last_series_diagnostics = {
-                "series_ticker": BTC_1H_SERIES_TICKER,
+                "series_ticker": series,
+                "open_count": len(open_rows),
+                "fallback_count": len(fallback),
+                "tradable_count": len(candidates),
+            }
+        else:
+            self.last_series_diagnostics = {
+                "series_ticker": series,
                 "open_count": len(open_rows),
                 "fallback_count": 0,
-                "tradable_count": len(open_rows),
-                "used_fallback": False,
+                "tradable_count": len(candidates),
             }
-            return sorted(open_rows, key=lambda m: (m.get("close_time", ""), m.get("ticker", "")))
+        return sorted(candidates, key=lambda m: (m.get("close_time", ""), m.get("ticker", "")))
 
-        fallback_rows = self._get_all_markets_for_series(BTC_1H_SERIES_TICKER, status=None)
-        tradable = [m for m in fallback_rows if self._is_tradable_series_market(m)]
-        self.last_series_diagnostics = {
-            "series_ticker": BTC_1H_SERIES_TICKER,
-            "open_count": 0,
-            "fallback_count": len(fallback_rows),
-            "tradable_count": len(tradable),
-            "used_fallback": True,
-        }
-        return sorted(tradable, key=lambda m: (m.get("close_time", ""), m.get("ticker", "")))
+    def get_open_hourly_range_markets(self) -> list[dict]:
+        series = settings.global_settings.btc_hourly_range_series_ticker
+        rows = self._get_all_markets_for_series(series, status="open")
+        return [r for r in rows if self.is_range_hourly_btc_market(r)]
+
+    def validate_hourly_series(self) -> dict:
+        series = settings.global_settings.btc_hourly_trade_series_ticker
+        try:
+            self._request("GET", f"/trade-api/v2/series/{series}")
+            return {"ok": True, "ticker": series}
+        except Exception as exc:
+            return {"ok": False, "ticker": series, "error": str(exc)}
 
     @staticmethod
     def extract_best_prices(orderbook: dict) -> dict:
-        def _price_from_level(level):
+        def _p(level):
             if isinstance(level, (list, tuple)) and level:
                 try:
                     return float(level[0])
-                except (TypeError, ValueError):
+                except Exception:
                     return None
             if isinstance(level, dict):
-                for key in ("price", "yes_price", "no_price", "value"):
-                    if level.get(key) is not None:
+                for k in ("price", "yes_price", "no_price", "value"):
+                    if level.get(k) is not None:
                         try:
-                            return float(level[key])
-                        except (TypeError, ValueError):
+                            return float(level[k])
+                        except Exception:
                             return None
             return None
 
-        def _best_bid(levels):
+        def _best(levels):
             if not isinstance(levels, list):
                 return None
-            prices = [p for p in (_price_from_level(level) for level in levels) if p is not None and 0 <= p <= 100]
-            return max(prices) if prices else None
+            vals = [v for v in (_p(x) for x in levels) if v is not None and 0 <= v <= 100]
+            return max(vals) if vals else None
 
         root = orderbook.get("orderbook", orderbook) if isinstance(orderbook, dict) else {}
-        yes_levels = root.get("yes")
-        no_levels = root.get("no")
-        if yes_levels is None and isinstance(root.get("yes_bids"), list):
-            yes_levels = root.get("yes_bids")
-        if no_levels is None and isinstance(root.get("no_bids"), list):
-            no_levels = root.get("no_bids")
-
-        yes_bid = _best_bid(yes_levels)
-        no_bid = _best_bid(no_levels)
-
-        yes_ask = (100 - no_bid) if no_bid is not None else None
-        no_ask = (100 - yes_bid) if yes_bid is not None else None
-
+        yes_bid = _best(root.get("yes") or root.get("yes_bids"))
+        no_bid = _best(root.get("no") or root.get("no_bids"))
+        yes_ask = 100 - no_bid if no_bid is not None else None
+        no_ask = 100 - yes_bid if yes_bid is not None else None
         if yes_ask is not None and not (0 <= yes_ask <= 100):
             yes_ask = None
         if no_ask is not None and not (0 <= no_ask <= 100):
             no_ask = None
+        return {"yes_bid": yes_bid, "yes_ask": yes_ask, "no_bid": no_bid, "no_ask": no_ask}
 
-        return {
-            "yes_bid": yes_bid,
-            "yes_ask": yes_ask,
-            "no_bid": no_bid,
-            "no_ask": no_ask,
-        }
+    def select_best_threshold_contract(self, markets: list[dict], spot_price: float | None) -> dict | None:
+        if not markets:
+            return None
+        parsed = []
+        for m in markets:
+            strike = parse_btc_threshold(m)
+            if strike is not None:
+                parsed.append((m, strike))
+        if not parsed:
+            mid = sorted(markets, key=lambda x: x.get("ticker", ""))[len(markets) // 2]
+            return mid
+        if spot_price is None:
+            parsed_sorted = sorted(parsed, key=lambda x: x[1])
+            return parsed_sorted[len(parsed_sorted) // 2][0]
+        parsed_sorted = sorted(parsed, key=lambda x: (abs(x[1] - spot_price), x[0].get("ticker", "")))
+        return parsed_sorted[0][0]
 
-    def get_hourly_series_quote_rows(self) -> list[dict]:
-        rows = []
-        for market in self.get_open_hourly_series_markets():
-            ticker = market.get("ticker", "")
-            best = {"yes_bid": None, "yes_ask": None, "no_bid": None, "no_ask": None}
-            error = None
+    def resolve_btc_hourly_trade_target_market(self, now: datetime | None = None, spot_price: float | None = None) -> dict | None:
+        now = now or datetime.now(timezone.utc)
+        markets = self.get_open_hourly_trade_markets()
+        if not markets:
+            return None
+        next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+        by_close = {}
+        for m in markets:
+            close = m.get("close_time")
+            if not close:
+                continue
             try:
-                orderbook = self.get_orderbook_snapshot(ticker)
-                best = self.extract_best_prices(orderbook)
+                close_dt = datetime.fromisoformat(close.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            by_close.setdefault(close_dt, []).append(m)
+        if not by_close:
+            return None
+        eligible = [c for c in by_close if c >= next_hour]
+        chosen_close = min(eligible) if eligible else min([c for c in by_close if c > now], default=min(by_close))
+        return self.select_best_threshold_contract(by_close.get(chosen_close, []), spot_price)
+
+    def get_hourly_series_quote_rows(self, markets: list[dict] | None = None) -> list[dict]:
+        rows = []
+        source = markets if markets is not None else self.get_open_hourly_trade_markets()
+        for market in source:
+            ticker = market.get("ticker", "")
+            quotes = {"yes_bid": None, "yes_ask": None, "no_bid": None, "no_ask": None}
+            err = None
+            try:
+                quotes = self.extract_best_prices(self.get_orderbook_snapshot(ticker))
             except Exception as exc:
-                error = str(exc)
+                err = str(exc)
             rows.append(
                 {
                     "ticker": ticker,
@@ -350,41 +330,18 @@ class KalshiClient:
                     "strike": parse_btc_threshold(market),
                     "status": market.get("status", ""),
                     "event_ticker": market.get("event_ticker", ""),
-                    **best,
+                    **quotes,
                     "last_update": datetime.now(timezone.utc).isoformat(),
-                    "error": error,
+                    "error": err,
                 }
             )
         return rows
 
-    def resolve_btc_target_market(self) -> Optional[dict]:
-        series_rows = self.get_open_hourly_series_markets()
-        if series_rows:
-            return series_rows[0]
-
-        fallback = self.list_open_markets().get("markets", [])
-        candidates = []
-        for market in fallback:
-            title = market.get("title", "")
-            if "BTC" not in title.upper():
-                continue
-            if self._close_minute(market) != 0:
-                continue
-            if not self._is_tradable_series_market(market):
-                continue
-            candidates.append(market)
-        return sorted(candidates, key=lambda m: (m.get("close_time", ""), m.get("ticker", "")))[0] if candidates else None
-
-    def _close_minute(self, market: dict) -> int:
-        close = market.get("close_time")
-        if not close:
-            return -1
-        return datetime.fromisoformat(close.replace("Z", "+00:00")).minute
 
 
 def parse_btc_threshold(market: dict) -> Optional[float]:
     text = " ".join([market.get("title", ""), market.get("subtitle", ""), market.get("ticker", "")])
-    match = re.search(r"(?:above|over|below|under|>=|<=|>|<)\s*\$?([0-9]{2,}(?:,[0-9]{3})*(?:\.[0-9]+)?)", text, re.I)
+    match = re.search(r"(?:above|over|below|under|>=|<=|>|<|at)\s*\$?([0-9]{2,}(?:,[0-9]{3})*(?:\.[0-9]+)?)", text, re.I)
     if not match:
         return None
     return float(match.group(1).replace(",", ""))
